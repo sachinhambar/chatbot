@@ -1,0 +1,14 @@
+[project]
+name = "chatbot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116.1",
+    "sqlalchemy>=2.0.43",
+    "strands-agents>=1.4.0",
+    "strands-agents-builder>=0.1.7",
+    "strands-agents-tools>=0.2.3",
+    "uvicorn[standard]>=0.35.0",
+]

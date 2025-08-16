@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Chat</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <!-- ===== LOGIN VIEW ===== -->
+      <section id="loginView" class="login">
+        <div class="login-card">
+          <h1>Welcome</h1>
+          <p class="muted">Sign in to continue</p>
+
+          <div class="field">
+            <label for="username">Username</label>
+            <input
+              id="username"
+              type="text"
+              autocomplete="username"
+              placeholder="you@example.com"
+            />
+          </div>
+          <div class="field">
+            <label for="password">Password</label>
+            <input
+              id="password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="••••••••"
+            />
+          </div>
+
+          <button id="btnLogin" class="btn wide">Sign in</button>
+          <div id="loginError" class="error" style="display: none"></div>
+        </div>
+      </section>
+
+      <!-- ===== CHAT VIEW ===== -->
+      <section id="chatView" class="chat-layout" style="display: none">
+        <!-- Sidebar: Conversations (headings only) -->
+        <aside id="history-panel">
+          <div class="right-head">
+            <h2>Conversations</h2>
+            <div class="right-actions">
+              <button id="new-chat-btn" class="btn">+ New</button>
+              <button id="reloadConvs" class="btn">Reload</button>
+            </div>
+          </div>
+          <div class="tools">
+            <input id="search" placeholder="Search titles…" />
+          </div>
+          <ul id="conversations-list"></ul>
+        </aside>
+
+        <!-- Main: Chat -->
+        <main id="chat-panel">
+          <div class="chat-head">
+            <div class="title">
+              <span id="chatTitle">Chat</span>
+              <span class="muted" id="sessionShort"></span>
+            </div>
+            <div class="actions">
+              <button id="logout" class="btn ghost">Logout</button>
+            </div>
+          </div>
+
+          <div id="messages" class="messages"></div>
+
+          <div id="input-area">
+            <input
+              id="user-input"
+              type="text"
+              placeholder="Type a message and hit Enter…"
+            />
+            <button id="send-btn" class="btn primary">Send</button>
+          </div>
+        </main>
+      </section>
+    </div>
+
+    <script>
+      // ================== CONFIG ==================
+      const API_HOST = "https://api.codetinkerlab.com"; // FastAPI HTTP base
+      const WS_URL = "wss://api.codetinkerlab.com/ws/chat"; // WebSocket
+
+      // ================== AUTH STATE ==================
+      const auth = {
+        tokenKey: "auth_token",
+        get token() {
+          return localStorage.getItem(this.tokenKey);
+        },
+        set token(v) {
+          v
+            ? localStorage.setItem(this.tokenKey, v)
+            : localStorage.removeItem(this.tokenKey);
+        },
+      };
+
+      // ================== APP STATE ==================
+      const state = {
+        sessionId: getOrCreateSessionId(),
+        ws: null,
+        chatItems: [],
+        convs: [],
+        filter: "",
+        activeConvId: null,
+      };
+
+      // ================== INIT ==================
+      document.getElementById("btnLogin").onclick = handleLogin;
+      document.getElementById("logout").onclick = handleLogout;
+
+      if (auth.token) {
+        showChat();
+        bootChat();
+      } else {
+        showLogin();
+      }
+
+      // ================== LOGIN FLOW ==================
+      async function handleLogin() {
+        const u = document.getElementById("username").value.trim();
+        const p = document.getElementById("password").value;
+        const err = document.getElementById("loginError");
+        err.style.display = "none";
+        err.textContent = "";
+
+        try {
+          const r = await fetch(API_HOST + "/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username: u, password: p }),
+          });
+          if (!r.ok) throw new Error("Invalid credentials");
+          const data = await r.json();
+          auth.token = data.token;
+          showChat();
+          bootChat();
+        } catch (e) {
+          err.textContent = "Login failed. Check username/password.";
+          err.style.display = "block";
+        }
+      }
+
+      function handleLogout() {
+        auth.token = null;
+        try {
+          state.ws && state.ws.close();
+        } catch {}
+        showLogin();
+      }
+
+      function showLogin() {
+        document.getElementById("loginView").style.display = "grid";
+        document.getElementById("chatView").style.display = "none";
+      }
+      function showChat() {
+        document.getElementById("loginView").style.display = "none";
+        document.getElementById("chatView").style.display = "grid";
+      }
+
+      async function bootChat() {
+        // UI events
+        document.getElementById("send-btn").onclick = sendMessage;
+        document
+          .getElementById("user-input")
+          .addEventListener("keydown", (e) => {
+            if (e.key === "Enter") sendMessage();
+          });
+        document.getElementById("new-chat-btn").onclick = newChat;
+        document.getElementById("reloadConvs").onclick =
+          loadConversationHeadings;
+        document.getElementById("search").oninput = (e) => {
+          state.filter = e.target.value.toLowerCase();
+          renderConversations();
+        };
+
+        updateSessionBadge();
+        connectWS();
+        await loadConversationHeadings();
+        // If you want to auto-select last active, pick first item:
+        if (state.convs[0]) {
+          await switchConversation(state.convs[0].id);
+        } else {
+          // else ensure messages cleared
+          state.chatItems = [];
+          renderChat();
+        }
+      }
+
+      // ================== SESSION HELPERS ==================
+      function getOrCreateSessionId() {
+        const key = "chat_session_id";
+        let sid = localStorage.getItem(key);
+        if (!sid) {
+          sid = crypto.randomUUID
+            ? crypto.randomUUID()
+            : String(Math.random()).slice(2);
+          localStorage.setItem(key, sid);
+        }
+        return sid;
+      }
+      function setSessionId(id) {
+        localStorage.setItem("chat_session_id", id);
+        state.sessionId = id;
+        updateSessionBadge();
+      }
+      function updateSessionBadge() {
+        document.getElementById("sessionShort").textContent =
+          "ID: " + state.sessionId.slice(0, 8) + "…";
+        document.getElementById("chatTitle").textContent =
+          "Chat (" + state.sessionId.slice(0, 8) + "…)";
+      }
+
+      // ================== API HELPERS ==================
+      function authHeaders(extra = {}) {
+        return auth.token
+          ? { ...extra, Authorization: "Bearer " + auth.token }
+          : extra;
+      }
+
+      async function apiListConversations(limit = 100) {
+        const r = await fetch(API_HOST + "/conversations?limit=" + limit, {
+          headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error("list conversations failed: " + r.status);
+        return await r.json(); // { items: [...] }
+      }
+      async function apiCreateConversation(title = null) {
+        const r = await fetch(API_HOST + "/conversations", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ title }),
+        });
+        if (!r.ok) throw new Error("create conversation failed: " + r.status);
+        return await r.json(); // { id, title, created_at }
+      }
+      async function apiHistory(sessionId, cursor = null, limit = 200) {
+        const url = new URL(API_HOST + "/history");
+        url.searchParams.set("session_id", sessionId);
+        url.searchParams.set("limit", String(limit));
+        if (cursor) url.searchParams.set("before_id", String(cursor));
+        const r = await fetch(url.toString(), { headers: authHeaders() });
+        if (!r.ok) throw new Error("history failed: " + r.status);
+        return await r.json(); // { groups, next_cursor }
+      }
+
+      // ================== CONVERSATIONS (RIGHT) ==================
+      async function loadConversationHeadings() {
+        try {
+          const data = await apiListConversations(200);
+          state.convs = data.items || [];
+          renderConversations();
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      function renderConversations() {
+        const ul = document.getElementById("conversations-list");
+        ul.innerHTML = "";
+        const q = state.filter;
+        const items = (state.convs || []).filter((c) => {
+          const t = (c.title || "Chat " + c.id.slice(0, 8)).toLowerCase();
+          return !q || t.includes(q);
+        });
+
+        if (!items.length) {
+          ul.innerHTML = `<li class="empty muted">No conversations.</li>`;
+          return;
+        }
+
+        for (const c of items) {
+          const li = document.createElement("li");
+          li.className = c.id === state.activeConvId ? "active" : "";
+          const when = c.last_message_at || c.created_at;
+          li.innerHTML = `
+          <div class="conv-title">${escapeHtml(
+            c.title || "Chat " + c.id.slice(0, 8)
+          )}</div>
+          <div class="conv-meta">
+            <span>${
+              when
+                ? new Date(when).toLocaleString([], {
+                    month: "short",
+                    day: "2-digit",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })
+                : ""
+            }</span>
+            <span class="id">ID: ${c.id}</span>
+          </div>
+        `;
+          li.onclick = () => switchConversation(c.id);
+          ul.appendChild(li);
+        }
+      }
+
+      async function newChat() {
+        try {
+          const meta = await apiCreateConversation(null);
+          state.convs.unshift({
+            id: meta.id,
+            title: meta.title,
+            created_at: meta.created_at,
+            last_message_at: null,
+            last_snippet: null,
+          });
+          renderConversations();
+          await switchConversation(meta.id);
+        } catch (e) {
+          console.error(e);
+          const sid = crypto.randomUUID
+            ? crypto.randomUUID()
+            : String(Math.random()).slice(2);
+          state.convs.unshift({
+            id: sid,
+            title: null,
+            created_at: new Date().toISOString(),
+            last_message_at: null,
+            last_snippet: null,
+          });
+          renderConversations();
+          await switchConversation(sid);
+        }
+      }
+
+      async function switchConversation(id) {
+        state.activeConvId = id;
+        setSessionId(id);
+        // highlight
+        [...document.getElementById("conversations-list").children].forEach(
+          (li) => li.classList.remove("active")
+        );
+        renderConversations();
+
+        // load messages
+        state.chatItems = [];
+        renderChat();
+        await loadConversationMessages();
+      }
+
+      // ================== MESSAGES (LEFT) ==================
+      async function loadConversationMessages() {
+        try {
+          let cursor = null;
+          const flat = [];
+          for (let i = 0; i < 10; i++) {
+            const page = await apiHistory(state.sessionId, cursor, 200);
+            const rows = flattenGroupsNewestFirst(page.groups || {});
+            flat.push(...rows);
+            if (!page.next_cursor) break;
+            cursor = page.next_cursor;
+          }
+          flat.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+          state.chatItems = flat.map((r) => ({
+            role: r.role,
+            content: r.content || "",
+            createdAt: new Date(r.created_at),
+          }));
+          renderChat();
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      function flattenGroupsNewestFirst(groups) {
+        const out = [];
+        const days = Object.keys(groups).sort(
+          (a, b) => new Date(b) - new Date(a)
+        );
+        for (const d of days) {
+          const arr = groups[d]
+            .slice()
+            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+          out.push(...arr);
+        }
+        return out;
+      }
+
+      function renderChat() {
+        const box = document.getElementById("messages");
+        box.innerHTML = "";
+        for (const m of state.chatItems) {
+          const div = document.createElement("div");
+          div.className =
+            "message " +
+            (m.role === "user" ? "user-message" : "assistant-message");
+          const safeContent =
+            m.role === "assistant"
+              ? renderMarkdown(m.content)
+              : escapeHtml(m.content);
+          div.innerHTML = safeContent;
+          box.appendChild(div);
+        }
+        box.scrollTop = box.scrollHeight;
+      }
+
+      // ================== WEBSOCKET ==================
+      function connectWS() {
+        try {
+          state.ws && state.ws.close();
+        } catch {}
+        const ws = new WebSocket(WS_URL);
+        state.ws = ws;
+
+        ws.onmessage = (event) => {
+          const msg = safeJson(event.data);
+          if (!msg) return;
+
+          switch (msg.type) {
+            case "chunk":
+              // stream assistant tokens into the last assistant bubble
+              appendAssistantDelta(msg.delta);
+              break;
+            case "done":
+              finalizeAssistant();
+              loadConversationHeadings(); // refresh last activity timestamps
+              break;
+          }
+        };
+
+        ws.onclose = () => setTimeout(connectWS, 1500);
+      }
+
+      function sendMessage() {
+        const input = document.getElementById("user-input");
+        const text = (input.value || "").trim();
+        if (!text) return;
+        if (!state.activeConvId) {
+          alert("Select or create a conversation first.");
+          return;
+        }
+
+        // show user bubble
+        addChatBubble("user", text);
+
+        // send to WS (server uses session_id to route/persist)
+        if (state.ws && state.ws.readyState === 1) {
+          state.ws.send(
+            JSON.stringify({
+              type: "message",
+              text,
+              session_id: state.sessionId,
+            })
+          );
+        }
+        input.value = "";
+      }
+
+      function addChatBubble(role, content) {
+        const createdAt = new Date();
+        state.chatItems.push({ role, content, createdAt });
+        renderChat();
+      }
+
+      let tempAssistantBuf = "";
+      function appendAssistantDelta(delta) {
+        if (!tempAssistantBuf) {
+          addChatBubble("assistant", "");
+        }
+        tempAssistantBuf += delta;
+        const last = state.chatItems[state.chatItems.length - 1];
+        if (last && last.role === "assistant") {
+          last.content = tempAssistantBuf;
+          renderChat();
+        }
+      }
+      function finalizeAssistant() {
+        tempAssistantBuf = "";
+      }
+
+      // ================== HELPERS ==================
+      function safeJson(s) {
+        try {
+          return JSON.parse(s);
+        } catch {
+          return null;
+        }
+      }
+      function escapeHtml(str) {
+        return String(str).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            }[c])
+        );
+      }
+
+      // Minimal Markdown -> HTML (safe-ish)
+      function renderMarkdown(md) {
+        if (!md) return "";
+        let s = escapeHtml(md);
+        s = s.replace(
+          /```([\s\S]*?)```/g,
+          (m, p1) => `<pre><code>${p1.replace(/^\n|\n$/g, "")}</code></pre>`
+        );
+        s = s.replace(/`([^`]+?)`/g, (m, p1) => `<code>${p1}</code>`);
+        s = s
+          .replace(/^######\s+(.+)$/gm, "<h6>$1</h6>")
+          .replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>")
+          .replace(/^####\s+(.+)$/gm, "<h4>$1</h4>")
+          .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
+          .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
+          .replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+        s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
+        s = s.replace(/\*([^*]+?)\*/g, "<em>$1</em>");
+        s = s.replace(
+          /\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g,
+          '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+        );
+        s = s.replace(
+          /(^|\n)([-*] .+(?:\n[-*] .+)*)/g,
+          (m, pfx, block) =>
+            `${pfx}<ul>${block
+              .split("\n")
+              .map((l) => l.replace(/^[-*] (.+)$/, "<li>$1</li>"))
+              .join("")}</ul>`
+        );
+        s = s.replace(
+          /(^|\n)((?:\d+\. .+(?:\n\d+\. .+)*))/g,
+          (m, pfx, block) =>
+            `${pfx}<ol>${block
+              .split("\n")
+              .map((l) => l.replace(/^\d+\. (.+)$/, "<li>$1</li>"))
+              .join("")}</ol>`
+        );
+        s = s
+          .split(/\n{2,}/)
+          .map((p) =>
+            /^\s*<(h\d|ul|ol|pre|blockquote)/i.test(p)
+              ? p
+              : `<p>${p.replace(/\n/g, "<br>")}</p>`
+          )
+          .join("\n");
+        return s;
+      }
+    </script>
+  </body>
+</html>
