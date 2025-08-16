@@ -28,7 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 import uvicorn
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Response,  Body, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Response, Body, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
